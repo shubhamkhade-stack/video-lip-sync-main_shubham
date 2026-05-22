@@ -1,294 +1,306 @@
 """
-Lip Sync Quality Scorer
-========================
-Evaluate lip-sync output quality by comparing original vs synced video.
+lip_sync_scorer.py — Corrected Lip-Sync Quality Scorer
+=======================================================
+Drop-in replacement for scoring/lip_sync_scorer.py.
 
-Metrics (all commercially safe):
-  1. Face Preservation (SSIM) — how well the face is preserved outside the lip region
-  2. Lip Movement Delta (LMD) — how much lip landmarks changed (expected: moderate change)
-  3. Visual Artifact Score — detects blurring/distortion around the mouth area
-  4. Overall Quality Score — weighted combination
+Reports TWO independent measurements (kept separate on purpose):
 
-Uses: OpenCV (BSD), scikit-image (BSD), MediaPipe (Apache 2.0)
+  1. SYNC ACCURACY  (PRIMARY)   — LSE-C / LSE-D via SyncNet. The ONLY metric
+     that tells you whether the mouth actually matches the audio.
+  2. VISUAL QUALITY (SECONDARY) — resolution-matched face-preservation SSIM
+     + mouth sharpness. Detects blur / artifacts ONLY. Does NOT measure sync.
+
+Bugs fixed vs the original scorer
+---------------------------------
+  * RESOLUTION MISMATCH: sync-3 / lipsync-2-pro change the output resolution
+    and sometimes fps. The original compared original-vs-synced by SSIM and
+    pixel bounding boxes, so a resolution change made it compare mismatched
+    frames -> garbage low score. FIX: every synced frame is resized to the
+    original's resolution before any comparison.
+  * WRONG PENALTY: the original scored lip-movement > 30 px as "distortion".
+    A different language legitimately needs different mouth shapes — that
+    punished correct sync. FIX: lip movement is informational only, not scored.
+  * NO REAL SYNC METRIC: the original had none. FIX: SyncNet LSE-C/LSE-D added
+    as the primary score (see run_syncnet() — needs SyncNet installed).
+
+Dependencies: opencv-python, numpy, mediapipe, scikit-image (all already in
+the pipeline). SyncNet is optional but required for the primary score.
 """
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import logging
+from pathlib import Path
 
 import cv2
 import numpy as np
 import mediapipe as mp_lib
-from pathlib import Path
 from skimage.metrics import structural_similarity as ssim
 
-from config import FACE_MODEL_PATH, OUTER_LIP_INDICES, ALL_LIP_INDICES, logger
+from config import FACE_MODEL_PATH, ALL_LIP_INDICES, logger
+
+logger = logging.getLogger("lip_sync_scorer")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PART 1 — PRIMARY METRIC: SyncNet LSE-C / LSE-D
+# ─────────────────────────────────────────────────────────────────────────────
+def run_syncnet(video_path: str) -> dict:
+    """Run SyncNet on a video and return {'lse_c', 'lse_d', 'av_offset'}.
+
+    LSE-C (confidence)  : higher = better sync.
+    LSE-D (distance)    : lower  = better sync.
+    av_offset (frames)  : 0 = perfectly aligned.
+
+    Requires the SyncNet repo. Set env var SYNCNET_DIR to its path, e.g.
+        export SYNCNET_DIR=/path/to/syncnet_python
+    Repo: https://github.com/joonson/syncnet_python  (also used by Wav2Lip's
+    LSE evaluation). If SYNCNET_DIR is unset or the scripts are missing, this
+    returns {'available': False} and the caller falls back to visual-only.
+    """
+    syncnet_dir = os.environ.get("SYNCNET_DIR", "").strip()
+    if not syncnet_dir or not Path(syncnet_dir).is_dir():
+        logger.warning("SYNCNET_DIR not set — sync accuracy NOT measured. "
+                       "Install SyncNet and set SYNCNET_DIR for the real score.")
+        return {"available": False}
+
+    pipeline = Path(syncnet_dir) / "run_pipeline.py"
+    scorer = Path(syncnet_dir) / "run_syncnet.py"
+    if not pipeline.exists() or not scorer.exists():
+        logger.warning("SyncNet scripts not found in %s — sync NOT measured.",
+                       syncnet_dir)
+        return {"available": False}
+
+    ref = "scene"
+    with tempfile.TemporaryDirectory(prefix="syncnet_") as tmp:
+        try:
+            subprocess.run(
+                ["python", str(pipeline), "--videofile", str(video_path),
+                 "--reference", ref, "--data_dir", tmp],
+                cwd=syncnet_dir, capture_output=True, text=True, check=True, timeout=600,
+            )
+            res = subprocess.run(
+                ["python", str(scorer), "--videofile", str(video_path),
+                 "--reference", ref, "--data_dir", tmp],
+                cwd=syncnet_dir, capture_output=True, text=True, check=True, timeout=600,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            logger.error("SyncNet run failed: %s", exc)
+            return {"available": False, "error": str(exc)}
+
+        out = (res.stdout or "") + (res.stderr or "")
+        # SyncNet prints lines like:  "AV offset: 3" / "Confidence: 7.421" / "Min dist: 6.832"
+        offset = _grab(out, r"AV offset:\s*(-?\d+\.?\d*)")
+        conf = _grab(out, r"Confidence:\s*(-?\d+\.?\d*)")
+        dist = _grab(out, r"Min dist:\s*(-?\d+\.?\d*)")
+        return {
+            "available": True,
+            "lse_c": conf,           # confidence — higher better
+            "lse_d": dist,           # distance   — lower better
+            "av_offset": offset,     # frames     — 0 best
+        }
+
+
+def _grab(text: str, pattern: str):
+    m = re.search(pattern, text)
+    return float(m.group(1)) if m else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PART 2 — SECONDARY METRIC: resolution-matched visual quality
+# ─────────────────────────────────────────────────────────────────────────────
 def _init_landmarker():
-    """Init MediaPipe Face Landmarker for lip landmark extraction."""
     BaseOptions = mp_lib.tasks.BaseOptions
     FaceLandmarker = mp_lib.tasks.vision.FaceLandmarker
     FaceLandmarkerOptions = mp_lib.tasks.vision.FaceLandmarkerOptions
     RunningMode = mp_lib.tasks.vision.RunningMode
-
-    options = FaceLandmarkerOptions(
+    return FaceLandmarker.create_from_options(FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=FACE_MODEL_PATH),
-        running_mode=RunningMode.VIDEO,
-        num_faces=5,
-        min_face_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    return FaceLandmarker.create_from_options(options)
+        running_mode=RunningMode.VIDEO, num_faces=5,
+        min_face_detection_confidence=0.5, min_tracking_confidence=0.5,
+    ))
 
 
-def _get_lip_landmarks(face_landmarks, w, h):
-    """Extract lip landmark coordinates (pixel space) from MediaPipe result."""
-    lips = {}
-    for idx in ALL_LIP_INDICES:
-        lm = face_landmarks[idx]
-        lips[idx] = (lm.x * w, lm.y * h)
-    return lips
+def _lip_bbox(landmarks, w, h, pad=10):
+    xs = [landmarks[i].x * w for i in ALL_LIP_INDICES]
+    ys = [landmarks[i].y * h for i in ALL_LIP_INDICES]
+    return (max(0, int(min(xs)) - pad), max(0, int(min(ys)) - pad),
+            min(w, int(max(xs)) + pad), min(h, int(max(ys)) + pad))
 
 
-def _get_face_bbox(face_landmarks, w, h, padding=20):
-    """Get face bounding box from landmarks."""
-    xs = [lm.x * w for lm in face_landmarks]
-    ys = [lm.y * h for lm in face_landmarks]
-    x1 = max(0, int(min(xs)) - padding)
-    y1 = max(0, int(min(ys)) - padding)
-    x2 = min(w, int(max(xs)) + padding)
-    y2 = min(h, int(max(ys)) + padding)
-    return x1, y1, x2, y2
+def _face_bbox(landmarks, w, h, pad=20):
+    xs = [lm.x * w for lm in landmarks]
+    ys = [lm.y * h for lm in landmarks]
+    return (max(0, int(min(xs)) - pad), max(0, int(min(ys)) - pad),
+            min(w, int(max(xs)) + pad), min(h, int(max(ys)) + pad))
 
 
-def _get_lip_bbox(lip_landmarks, w, h, padding=10):
-    """Get bounding box around lip region."""
-    xs = [pt[0] for pt in lip_landmarks.values()]
-    ys = [pt[1] for pt in lip_landmarks.values()]
-    x1 = max(0, int(min(xs)) - padding)
-    y1 = max(0, int(min(ys)) - padding)
-    x2 = min(w, int(max(xs)) + padding)
-    y2 = min(h, int(max(ys)) + padding)
-    return x1, y1, x2, y2
-
-
-def _lip_landmark_distance(lips_orig, lips_synced):
-    """Calculate normalized average distance between original and synced lip landmarks."""
-    if not lips_orig or not lips_synced:
+def _sharpness(frame, bbox):
+    x1, y1, x2, y2 = bbox
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
         return 0.0
-    distances = []
-    for idx in lips_orig:
-        if idx in lips_synced:
-            ox, oy = lips_orig[idx]
-            sx, sy = lips_synced[idx]
-            distances.append(np.sqrt((ox - sx) ** 2 + (oy - sy) ** 2))
-    return np.mean(distances) if distances else 0.0
-
-
-def _mouth_region_sharpness(frame, lip_bbox):
-    """Measure sharpness of mouth region using Laplacian variance."""
-    x1, y1, x2, y2 = lip_bbox
-    mouth_crop = frame[y1:y2, x1:x2]
-    if mouth_crop.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(mouth_crop, cv2.COLOR_BGR2GRAY) if len(mouth_crop.shape) == 3 else mouth_crop
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-def score_scene(original_path, synced_path, sample_fps=3):
+def score_visual_quality(original_path: str, synced_path: str, sample_fps: int = 3) -> dict:
+    """Resolution-matched visual-artifact check (face preservation + sharpness).
+
+    This is a SECONDARY check — it detects blur/distortion, NOT sync accuracy.
     """
-    Score a single scene by comparing original vs synced video.
+    cap_o = cv2.VideoCapture(str(original_path))
+    cap_s = cv2.VideoCapture(str(synced_path))
 
-    Args:
-        original_path: Path to original scene video.
-        synced_path: Path to synced scene video.
-        sample_fps: Frames per second to sample.
+    # --- FIX: resolution match -------------------------------------------------
+    ow = int(cap_o.get(cv2.CAP_PROP_FRAME_WIDTH))
+    oh = int(cap_o.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    sw = int(cap_s.get(cv2.CAP_PROP_FRAME_WIDTH))
+    sh = int(cap_s.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    resized = (ow, oh) != (sw, sh)
+    if resized:
+        logger.info("resolution differs (orig %dx%d vs sync %dx%d) — "
+                    "resizing synced frames to original before comparison",
+                    ow, oh, sw, sh)
 
-    Returns:
-        dict with scores:
-            - face_preservation: SSIM of non-lip face region (0-1, higher=better)
-            - lip_movement_delta: Average lip landmark change in pixels
-            - mouth_sharpness_ratio: Synced/original mouth sharpness (1.0=same, <1=blurrier)
-            - overall_score: Weighted quality score (0-100)
-            - frames_scored: Number of frames compared
-            - details: Per-frame breakdown
-    """
-    cap_orig = cv2.VideoCapture(str(original_path))
-    cap_sync = cv2.VideoCapture(str(synced_path))
-
-    fps = cap_orig.get(cv2.CAP_PROP_FPS) or 25
-    frame_interval = max(1, int(fps / sample_fps))
-    total_orig = int(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT))
-    total_sync = int(cap_sync.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if total_orig == 0 or total_sync == 0:
-        cap_orig.release()
-        cap_sync.release()
-        return {"overall_score": 0, "error": "Empty video"}
-
+    fps = cap_o.get(cv2.CAP_PROP_FPS) or 25
+    step = max(1, int(fps / sample_fps))
     landmarker = _init_landmarker()
 
-    face_ssim_scores = []
-    lip_deltas = []
-    sharpness_orig_list = []
-    sharpness_sync_list = []
-    per_frame = []
-
-    frame_idx = 0
-
+    face_ssims, sharp_o, sharp_s = [], [], []
+    idx = 0
     while True:
-        ret_o, frame_orig = cap_orig.read()
-        ret_s, frame_sync = cap_sync.read()
-        if not ret_o or not ret_s:
+        ok_o, fo = cap_o.read()
+        ok_s, fs = cap_s.read()
+        if not ok_o or not ok_s:
             break
+        if idx % step == 0:
+            # FIX: bring synced frame into the original's pixel space
+            if (fs.shape[1], fs.shape[0]) != (ow, oh):
+                fs = cv2.resize(fs, (ow, oh), interpolation=cv2.INTER_AREA)
 
-        if frame_idx % frame_interval == 0:
-            h, w = frame_orig.shape[:2]
+            ts = int(cap_o.get(cv2.CAP_PROP_POS_MSEC))
+            ro = landmarker.detect_for_video(
+                mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB,
+                             data=cv2.cvtColor(fo, cv2.COLOR_BGR2RGB)), ts)
+            rs = landmarker.detect_for_video(
+                mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB,
+                             data=cv2.cvtColor(fs, cv2.COLOR_BGR2RGB)), ts + 1)
+            if ro.face_landmarks and rs.face_landmarks:
+                lm_o = ro.face_landmarks[0]
+                fx1, fy1, fx2, fy2 = _face_bbox(lm_o, ow, oh)
+                go = cv2.cvtColor(fo[fy1:fy2, fx1:fx2], cv2.COLOR_BGR2GRAY)
+                gs = cv2.cvtColor(fs[fy1:fy2, fx1:fx2], cv2.COLOR_BGR2GRAY)
+                if go.shape == gs.shape and go.size > 0:
+                    win = min(7, go.shape[0], go.shape[1])
+                    if win >= 3 and win % 2 == 1:
+                        face_ssims.append(ssim(go, gs, win_size=win))
+                lb = _lip_bbox(lm_o, ow, oh)
+                sharp_o.append(_sharpness(fo, lb))
+                sharp_s.append(_sharpness(fs, lb))
+        idx += 1
 
-            # Get landmarks from both frames
-            rgb_orig = cv2.cvtColor(frame_orig, cv2.COLOR_BGR2RGB)
-            rgb_sync = cv2.cvtColor(frame_sync, cv2.COLOR_BGR2RGB)
-
-            mp_orig = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=rgb_orig)
-            mp_sync = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=rgb_sync)
-
-            ts = int(cap_orig.get(cv2.CAP_PROP_POS_MSEC))
-            res_orig = landmarker.detect_for_video(mp_orig, ts)
-            res_sync = landmarker.detect_for_video(mp_sync, ts + 1)  # +1 to avoid duplicate ts
-
-            if not res_orig.face_landmarks or not res_sync.face_landmarks:
-                frame_idx += 1
-                continue
-
-            # Use first detected face
-            lm_orig = res_orig.face_landmarks[0]
-            lm_sync = res_sync.face_landmarks[0]
-
-            lips_orig = _get_lip_landmarks(lm_orig, w, h)
-            lips_sync = _get_lip_landmarks(lm_sync, w, h)
-
-            # 1. Face Preservation SSIM (exclude lip region)
-            face_bbox = _get_face_bbox(lm_orig, w, h)
-            lip_bbox_orig = _get_lip_bbox(lips_orig, w, h)
-
-            fx1, fy1, fx2, fy2 = face_bbox
-            face_orig = cv2.cvtColor(frame_orig[fy1:fy2, fx1:fx2], cv2.COLOR_BGR2GRAY)
-            face_sync = cv2.cvtColor(frame_sync[fy1:fy2, fx1:fx2], cv2.COLOR_BGR2GRAY)
-
-            # Mask out lip region for face SSIM
-            lx1, ly1, lx2, ly2 = lip_bbox_orig
-            mask = np.ones_like(face_orig, dtype=bool)
-            # Convert lip bbox to face-crop coordinates
-            rel_lx1 = max(0, lx1 - fx1)
-            rel_ly1 = max(0, ly1 - fy1)
-            rel_lx2 = min(face_orig.shape[1], lx2 - fx1)
-            rel_ly2 = min(face_orig.shape[0], ly2 - fy1)
-            mask[rel_ly1:rel_ly2, rel_lx1:rel_lx2] = False
-
-            if face_orig.shape == face_sync.shape and face_orig.size > 0:
-                win_size = min(7, face_orig.shape[0], face_orig.shape[1])
-                if win_size >= 3 and win_size % 2 == 1:
-                    full_ssim = ssim(face_orig, face_sync, win_size=win_size)
-                    face_ssim_scores.append(full_ssim)
-                else:
-                    full_ssim = None
-            else:
-                full_ssim = None
-
-            # 2. Lip Movement Delta
-            lip_delta = _lip_landmark_distance(lips_orig, lips_sync)
-            lip_deltas.append(lip_delta)
-
-            # 3. Mouth Sharpness
-            sharp_orig = _mouth_region_sharpness(frame_orig, lip_bbox_orig)
-            lip_bbox_sync = _get_lip_bbox(lips_sync, w, h)
-            sharp_sync = _mouth_region_sharpness(frame_sync, lip_bbox_sync)
-            sharpness_orig_list.append(sharp_orig)
-            sharpness_sync_list.append(sharp_sync)
-
-            per_frame.append({
-                "frame": frame_idx,
-                "face_ssim": round(full_ssim, 4) if full_ssim is not None else None,
-                "lip_delta_px": round(lip_delta, 2),
-                "mouth_sharpness_orig": round(sharp_orig, 1),
-                "mouth_sharpness_sync": round(sharp_sync, 1),
-            })
-
-        frame_idx += 1
-
-    cap_orig.release()
-    cap_sync.release()
+    cap_o.release()
+    cap_s.release()
     landmarker.close()
 
-    if not per_frame:
-        return {"overall_score": 0, "error": "No faces detected", "frames_scored": 0}
+    if not face_ssims:
+        return {"visual_quality_score": None, "error": "no faces detected",
+                "resolution_matched": resized}
 
-    # Aggregate scores
-    avg_face_ssim = np.mean(face_ssim_scores) if face_ssim_scores else 0
-    avg_lip_delta = np.mean(lip_deltas) if lip_deltas else 0
-    avg_sharp_orig = np.mean(sharpness_orig_list) if sharpness_orig_list else 1
-    avg_sharp_sync = np.mean(sharpness_sync_list) if sharpness_sync_list else 1
-    sharpness_ratio = avg_sharp_sync / avg_sharp_orig if avg_sharp_orig > 0 else 1.0
+    avg_ssim = float(np.mean(face_ssims))
+    so = float(np.mean(sharp_o)) if sharp_o else 1.0
+    ss = float(np.mean(sharp_s)) if sharp_s else 1.0
+    sharp_ratio = ss / so if so > 0 else 1.0
 
-    # Overall Score (0-100):
-    #   Face Preservation (40%): SSIM of non-lip face — want high (>0.85)
-    #   Mouth Sharpness (30%):   Synced mouth shouldn't be blurrier — want ratio ~1.0
-    #   Lip Naturalness (30%):   Some movement expected (3-30px is healthy range)
-
-    face_score = min(avg_face_ssim / 0.95, 1.0) * 100  # 0.95 SSIM = perfect
-    sharpness_score = min(sharpness_ratio / 0.9, 1.0) * 100  # 0.9 ratio = acceptable
-    # Lip delta: 3-30px is ideal range, too low = no sync, too high = distortion
-    if avg_lip_delta < 1:
-        lip_score = 30  # barely changed — sync might not have worked
-    elif avg_lip_delta <= 30:
-        lip_score = 100  # healthy range
-    elif avg_lip_delta <= 60:
-        lip_score = 70   # moderate distortion
-    else:
-        lip_score = 40   # heavy distortion
-
-    overall = 0.40 * face_score + 0.30 * sharpness_score + 0.30 * lip_score
+    # Visual quality = face preserved (60%) + mouth not blurrier than source (40%)
+    face_score = min(avg_ssim / 0.95, 1.0) * 100
+    sharp_score = min(sharp_ratio / 0.9, 1.0) * 100
+    visual = round(0.60 * face_score + 0.40 * sharp_score, 1)
 
     return {
-        "face_preservation_ssim": round(avg_face_ssim, 4),
-        "lip_movement_delta_px": round(avg_lip_delta, 2),
-        "mouth_sharpness_ratio": round(sharpness_ratio, 4),
-        "face_score": round(face_score, 1),
-        "sharpness_score": round(sharpness_score, 1),
-        "lip_naturalness_score": round(lip_score, 1),
-        "overall_score": round(overall, 1),
-        "frames_scored": len(per_frame),
-        "details": per_frame,
+        "visual_quality_score": visual,            # 0-100, artifact check only
+        "face_preservation_ssim": round(avg_ssim, 4),
+        "mouth_sharpness_ratio": round(sharp_ratio, 4),
+        "resolution_matched": resized,
+        "frames_scored": len(face_ssims),
     }
 
 
-def score_all_scenes(original_dir, synced_dir, sample_fps=3):
-    """
-    Score all scenes by comparing original vs synced videos.
+# ─────────────────────────────────────────────────────────────────────────────
+# PART 3 — Combined report (sync primary, visual secondary, baseline-relative)
+# ─────────────────────────────────────────────────────────────────────────────
+def score_scene(original_path: str, synced_path: str,
+                baseline_lse: dict | None = None, sample_fps: int = 3) -> dict:
+    """Full scene score.
 
-    Args:
-        original_dir: Directory with original scene videos (scene_001.mp4, ...)
-        synced_dir: Directory with synced scene videos (same names)
-        sample_fps: Frames per second to sample.
-
-    Returns:
-        dict: {scene_name: score_result}
+    `baseline_lse` = run_syncnet(<original video>) — the ceiling the dub aims
+    to approach. Pass it so the report shows sync RELATIVE to the original.
     """
-    original_dir = Path(original_dir)
-    synced_dir = Path(synced_dir)
+    sync = run_syncnet(synced_path)
+    visual = score_visual_quality(original_path, synced_path, sample_fps)
+
+    report = {
+        "sync": sync,                 # PRIMARY — LSE-C/LSE-D
+        "visual": visual,             # SECONDARY — artifact check
+        "baseline": baseline_lse,     # original video's own LSE for comparison
+    }
+
+    # Verdict logic — sync metric decides; visual is a quality gate.
+    if sync.get("available"):
+        lse_c, lse_d = sync.get("lse_c"), sync.get("lse_d")
+        report["primary_metric"] = "LSE-C/LSE-D (SyncNet)"
+        if baseline_lse and baseline_lse.get("available"):
+            bc = baseline_lse.get("lse_c")
+            report["gap_to_baseline_lse_c"] = (
+                round(lse_c - bc, 3) if (lse_c is not None and bc is not None) else None)
+        report["verdict"] = _verdict(lse_c, lse_d, visual.get("visual_quality_score"))
+    else:
+        report["primary_metric"] = "NOT MEASURED — install SyncNet (set SYNCNET_DIR)"
+        report["verdict"] = "VISUAL-ONLY — sync accuracy unknown until SyncNet is set up"
+
+    return report
+
+
+def _verdict(lse_c, lse_d, visual_score):
+    """Rough verdict. Calibrate thresholds against your own baseline video."""
+    if lse_c is None:
+        return "sync not measured"
+    if visual_score is not None and visual_score < 60:
+        return "VISUAL ARTIFACTS — mouth blurry / face altered; check model & input res"
+    if lse_c >= 6:
+        return "GOOD sync"
+    if lse_c >= 4:
+        return "MARGINAL sync — re-check audio timing"
+    return "POOR sync — audio is mistimed or input video face is not clearly talking"
+
+
+def score_all_scenes(original_dir, synced_dir, baseline_video=None, sample_fps=3):
+    """Score every scene_*.mp4 pair. Computes the baseline LSE once."""
+    original_dir, synced_dir = Path(original_dir), Path(synced_dir)
+    baseline = run_syncnet(str(baseline_video)) if baseline_video else None
     results = {}
-
-    originals = sorted(original_dir.glob("scene_*.mp4"))
-    if not originals:
-        logger.error(f"No scene videos found in {original_dir}")
-        return results
-
-    for orig_path in originals:
-        sync_path = synced_dir / orig_path.name
-        if not sync_path.exists():
-            logger.warning(f"  Synced video not found for {orig_path.name}, skipping")
+    for orig in sorted(original_dir.glob("scene_*.mp4")):
+        synced = synced_dir / orig.name
+        if not synced.exists():
+            logger.warning("no synced video for %s", orig.name)
             continue
-
-        scene_name = orig_path.stem
-        logger.info(f"  Scoring {scene_name}...")
-        results[scene_name] = score_scene(str(orig_path), str(sync_path), sample_fps)
-        logger.info(f"    -> Overall: {results[scene_name]['overall_score']}/100")
-
+        logger.info("scoring %s ...", orig.stem)
+        results[orig.stem] = score_scene(str(orig), str(synced), baseline, sample_fps)
     return results
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    import sys
+    if len(sys.argv) >= 3:
+        rep = score_scene(sys.argv[1], sys.argv[2])
+        import json
+        print(json.dumps(rep, indent=2))
+    else:
+        print("usage: python lip_sync_scorer.py <original.mp4> <synced.mp4>")

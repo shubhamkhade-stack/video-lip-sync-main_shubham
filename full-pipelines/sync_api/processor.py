@@ -11,31 +11,26 @@ from config import S3_PREFIX, PARALLEL_JOBS, logger
 from utils import progress
 from sync_api.s3 import _ensure_s3_folder, _upload_scenes_to_s3
 from sync_api.client import sync_create_job, sync_poll, sync_download
+from sync_api.sync_client import process_scene as hybrid_process_scene
 
 
 def process_single_scene(scene_num, video_url, audio_url, output_path, api_key,
                          is_complex=False, is_obstructed=False, multi_person=False):
     """Process a single scene through sync.so API. Returns (scene_num, success, error)."""
     try:
-        job = sync_create_job(
-            video_url, audio_url, api_key,
-            reasoning=is_complex,
-            detect_obstructions=is_obstructed,
-            active_speaker=multi_person,
-            output_name=f"scene_{scene_num:03d}_synced",
+        scene_meta = {
+            "scene": scene_num,
+            "multi_person": multi_person,
+            "has_occlusion": is_obstructed,
+            "is_complex": is_complex,
+            "is_closeup": False,
+            "extreme_angle": False,
+        }
+        rec = hybrid_process_scene(
+            scene_meta, video_url, audio_url, api_key,
+            str(output_path), temperature=0.6,
         )
-
-        result = sync_poll(job["id"], api_key)
-        status = result.get("status")
-
-        if status == "COMPLETED":
-            output_url = result.get("outputUrl") or result.get("output_url")
-            if output_url:
-                sync_download(output_url, str(output_path))
-                return scene_num, True, None
-            return scene_num, False, "No output URL"
-        else:
-            return scene_num, False, f"Status: {status}, Error: {result.get('error', 'N/A')}"
+        return scene_num, rec["status"] == "COMPLETED", rec.get("error")
 
     except Exception as e:
         return scene_num, False, str(e)
