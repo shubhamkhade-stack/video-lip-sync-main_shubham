@@ -1,0 +1,22 @@
+# Task folders (generated at runtime)
+task_*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# YOLO model (auto-downloads)
+yolov8n.pt
+runs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
